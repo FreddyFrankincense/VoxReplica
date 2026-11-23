@@ -1,0 +1,6 @@
+{
+  "name": "VoxReplica Studio",
+  "description": "Personal voice profiling, conversational speaker diarization, and vocal nuance synthesis workbench powered by Web Audio DSP and Gemini Voice Design.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
