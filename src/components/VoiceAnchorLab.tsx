@@ -233,8 +233,11 @@ export const VoiceAnchorLab: React.FC<VoiceAnchorLabProps> = ({
       offset += chunk.length;
     }
 
-    const offlineCtx = new OfflineAudioContext(1, totalLen, sampleRate);
-    const audioBuffer = offlineCtx.createBuffer(1, totalLen, sampleRate);
+    const audioBuffer = new AudioBuffer({
+      length: totalLen,
+      numberOfChannels: 1,
+      sampleRate,
+    });
     audioBuffer.copyToChannel(merged, 0);
 
     await processCapturedAudioBuffer(audioBuffer, activePrompt);

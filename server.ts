@@ -15,6 +15,9 @@ const PORT = 3000;
 // Increase body limit to handle base64 WAV audio slices (up to 35MB)
 app.use(express.json({ limit: '35mb' }));
 
+let cachedAiClient: GoogleGenAI | null = null;
+let cachedApiKey: string | undefined;
+
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -22,15 +25,33 @@ function getAiClient(): GoogleGenAI {
       'GEMINI_API_KEY is not configured. Please check the Settings > Secrets panel.'
     );
   }
-  return new GoogleGenAI({
-    apiKey,
-    apiVersion: 'v1beta',
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  if (!cachedAiClient || cachedApiKey !== apiKey) {
+    cachedAiClient = new GoogleGenAI({
+      apiKey,
+      apiVersion: 'v1beta',
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
-    },
-  });
+    });
+    cachedApiKey = apiKey;
+  }
+  return cachedAiClient;
+}
+
+function parseJsonSafely<T>(rawText: string | undefined, fallback: T): T {
+  if (!rawText) return fallback;
+  try {
+    const cleaned = rawText
+      .trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/\s*```$/i, '')
+      .trim();
+    return JSON.parse(cleaned) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 async function transcribeAudioSafely(
@@ -144,7 +165,7 @@ Return a concise JSON object describing their vocal characteristics.`,
       },
     });
 
-    const parsed = JSON.parse((analysisResponse.text ?? '{}').trim());
+    const parsed = parseJsonSafely<Record<string, any>>(analysisResponse.text, {});
 
     res.json({
       transcript: transcript || promptText || 'Audio sample captured',
@@ -264,7 +285,7 @@ Return the structured speaker diarization result.`,
       },
     });
 
-    const result = JSON.parse((diarizeResp.text ?? '{}').trim());
+    const result = parseJsonSafely<Record<string, any>>(diarizeResp.text, {});
     const validAssignment = ['target_user', 'other_speaker', 'crosstalk'].includes(result.assignment)
       ? result.assignment
       : 'target_user';
@@ -394,7 +415,7 @@ Based on both the attached reference audio samples (if any) and the measured aco
       },
     });
 
-    const parsed = JSON.parse((response.text ?? '{}').trim());
+    const parsed = parseJsonSafely<Record<string, any>>(response.text, {});
     const allowedVoices = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'];
     const baseVoice = allowedVoices.includes(parsed.baseFoundationVoice)
       ? parsed.baseFoundationVoice

@@ -279,9 +279,14 @@ export function computeLearnedCorpusDiagnostic(
           elements.reduce((sum, el) => sum + el.confidencePercent, 0) / elements.length
         );
 
+  const isExplicitlyTrainedProfile =
+    baseProfile.anchorSampleCount > 0 ||
+    baseProfile.isolatedSegmentCount > 0 ||
+    baseProfile.updatedAt !== '2026-11-23T09:15:00.000Z';
+
   // Dynamically choose foundation voice & DSP offsets learned from submitted clips
   const learnedFoundationVoice: CustomVoiceProfile['baseFoundationVoice'] =
-    allMetrics.length === 0
+    allMetrics.length === 0 || isExplicitlyTrainedProfile
       ? baseProfile.baseFoundationVoice
       : medianF0Hz < 122
       ? 'Charon'
@@ -302,7 +307,7 @@ export function computeLearnedCorpusDiagnostic(
   };
 
   const learnedPitchShiftSemitones =
-    allMetrics.length > 0
+    allMetrics.length > 0 && !isExplicitlyTrainedProfile
       ? Number(
           Math.max(
             -3.0,
@@ -315,19 +320,19 @@ export function computeLearnedCorpusDiagnostic(
       : baseProfile.dspCalibration.pitchShiftSemitones;
 
   const learnedPlaybackRate =
-    allMetrics.length > 0
+    allMetrics.length > 0 && !isExplicitlyTrainedProfile
       ? Number(Math.max(0.88, Math.min(1.15, avgWpm / 148)).toFixed(2))
       : baseProfile.dspCalibration.playbackRate;
 
   const learnedWarmthDb =
-    allMetrics.length > 0
+    allMetrics.length > 0 && !isExplicitlyTrainedProfile
       ? Number(
           Math.max(-2.5, Math.min(4.0, (1650 - spectralWarmthHz) / 220)).toFixed(1)
         )
       : baseProfile.dspCalibration.formantWarmthDb;
 
   const dynamicDirective =
-    allMetrics.length > 0
+    allMetrics.length > 0 && !isExplicitlyTrainedProfile
       ? `Learned vocal replica (${medianF0Hz} Hz median F0, ±${f0StdDevHz} Hz inflection variance, ${avgWpm} WPM tempo, ${Math.round(
           avgPauseRatio * 100
         )}% pause ratio). ${baseProfile.voiceDesignDirective}`

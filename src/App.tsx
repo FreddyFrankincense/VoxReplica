@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AudioWaveform,
   Cpu,
@@ -81,7 +81,10 @@ export default function App() {
   const activeProfile =
     profiles.find((p) => p.id === activeProfileId) || profiles[0] || DEFAULT_VOICE_PROFILE;
 
-  const diagnostic = computeLearnedCorpusDiagnostic(anchors, segments, activeProfile);
+  const diagnostic = useMemo(
+    () => computeLearnedCorpusDiagnostic(anchors, segments, activeProfile),
+    [anchors, segments, activeProfile]
+  );
   const lowestElement = diagnostic.elementsByLowestConfidence[0] || null;
 
   const handleJumpToAnchorWithScript = (script?: string, title?: string) => {
@@ -110,6 +113,12 @@ export default function App() {
     );
   };
 
+  const handleBatchUpdateSegments = (
+    updater: (seg: ConversationSegment) => ConversationSegment
+  ) => {
+    setSegments((prev) => prev.map(updater));
+  };
+
   const handleRemoveSegment = (id: string) => {
     setSegments((prev) => prev.filter((seg) => seg.id !== id));
   };
@@ -131,6 +140,12 @@ export default function App() {
 
   const handleAddTake = (take: SynthesisTake) => {
     setTakes((prev) => [take, ...prev]);
+  };
+
+  const handleUpdateTake = (id: string, patch: Partial<SynthesisTake>) => {
+    setTakes((prev) =>
+      prev.map((t) => (t.id === id ? { ...t, ...patch } : t))
+    );
   };
 
   const handleRemoveTake = (id: string) => {
@@ -414,6 +429,7 @@ export default function App() {
               segments={segments}
               onAddSegments={handleAddSegments}
               onUpdateSegment={handleUpdateSegment}
+              onBatchUpdateSegments={handleBatchUpdateSegments}
               onRemoveSegment={handleRemoveSegment}
               onClearAllSegments={handleClearAllSegments}
               onProceedToProfile={() => setActiveStage('profile')}
@@ -438,6 +454,7 @@ export default function App() {
               anchors={anchors}
               takes={takes}
               onAddTake={handleAddTake}
+              onUpdateTake={handleUpdateTake}
               onRemoveTake={handleRemoveTake}
               onJumpToAnchorLab={(script) =>
                 handleJumpToAnchorWithScript(

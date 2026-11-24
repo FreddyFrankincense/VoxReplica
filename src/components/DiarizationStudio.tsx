@@ -1,7 +1,5 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  Check,
-  Filter,
   Loader2,
   Play,
   SlidersHorizontal,
@@ -28,6 +26,7 @@ interface DiarizationStudioProps {
   segments: ConversationSegment[];
   onAddSegments: (newSegments: ConversationSegment[]) => void;
   onUpdateSegment: (id: string, patch: Partial<ConversationSegment>) => void;
+  onBatchUpdateSegments: (updater: (seg: ConversationSegment) => ConversationSegment) => void;
   onRemoveSegment: (id: string) => void;
   onClearAllSegments: () => void;
   onProceedToProfile: () => void;
@@ -38,6 +37,7 @@ export const DiarizationStudio: React.FC<DiarizationStudioProps> = ({
   segments,
   onAddSegments,
   onUpdateSegment,
+  onBatchUpdateSegments,
   onRemoveSegment,
   onClearAllSegments,
   onProceedToProfile,
@@ -52,6 +52,15 @@ export const DiarizationStudio: React.FC<DiarizationStudioProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+    };
+  }, []);
 
   const anchorDspList = anchors.map((a) => a.dspMetrics);
   const avgAnchorF0 =
@@ -358,18 +367,19 @@ export const DiarizationStudio: React.FC<DiarizationStudioProps> = ({
   };
 
   const handleAutoIsolateHighConfidence = () => {
-    segments.forEach((seg) => {
+    onBatchUpdateSegments((seg) => {
       if (seg.similarityToAnchorScore >= 70 && seg.assignment !== 'crosstalk') {
-        onUpdateSegment(seg.id, {
+        return {
+          ...seg,
           assignment: 'target_user',
           detectedSpeakerLabel: 'Target User (Auto-Verified)',
           includedInCorpus: true,
-        });
-      } else {
-        onUpdateSegment(seg.id, {
-          includedInCorpus: false,
-        });
+        };
       }
+      return {
+        ...seg,
+        includedInCorpus: false,
+      };
     });
   };
 

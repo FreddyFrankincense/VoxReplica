@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -33,6 +33,15 @@ export const LiveProfileAuditionBar: React.FC<LiveProfileAuditionBarProps> = ({
   const [apiErrorMsg, setApiErrorMsg] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, []);
 
   const {
     meetsDataFloor,

@@ -115,4 +115,25 @@ export interface SynthesisTake {
   durationSec: number;
   waveformPeaks: number[];
   createdAt: string;
+  // Non-destructive trim / crop history
+  originalCalibratedWavBase64?: string;
+  originalRawWavBase64?: string;
+  originalDurationSec?: number;
+  lastTrimStartSec?: number;
+  lastTrimEndSec?: number;
+  isTrimmed?: boolean;
+  batchTaskLabel?: string;
+}
+
+export type BatchTaskStatus = 'queued' | 'processing' | 'completed' | 'failed';
+
+export interface BatchQueueTask {
+  id: string;
+  label: string;
+  script: string;
+  nuanceSettings: NuanceSettings;
+  status: BatchTaskStatus;
+  errorMessage?: string;
+  generatedTakeId?: string;
+  createdAt: string;
 }

@@ -1,18 +1,24 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   CheckCircle2,
   Download,
   FileAudio,
   Layers,
+  ListPlus,
   Loader2,
   Play,
+  PlayCircle,
   RotateCcw,
+  Scissors,
   Sparkles,
+  Split,
   Trash2,
   Volume2,
   Wand2,
 } from 'lucide-react';
 import {
+  BatchQueueTask,
   CustomVoiceProfile,
   EmotionalTonePreset,
   NuanceSettings,
@@ -28,6 +34,7 @@ import {
   stitchTakesToMasterWav,
 } from '../utils/audioDsp';
 import { WaveformBars } from './WaveformVisualizer';
+import { WaveformTrimEditor } from './WaveformTrimEditor';
 import { LearnedCorpusDiagnostic } from '../utils/phonemeCoverage';
 
 interface SynthesisStudioProps {
@@ -36,6 +43,7 @@ interface SynthesisStudioProps {
   anchors: VoiceAnchorSample[];
   takes: SynthesisTake[];
   onAddTake: (take: SynthesisTake) => void;
+  onUpdateTake: (id: string, patch: Partial<SynthesisTake>) => void;
   onRemoveTake: (id: string) => void;
   onJumpToAnchorLab: (targetedScript?: string) => void;
 }
@@ -79,6 +87,7 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
   anchors,
   takes,
   onAddTake,
+  onUpdateTake,
   onRemoveTake,
   onJumpToAnchorLab,
 }) => {
@@ -98,6 +107,9 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
   const [exportStatusMsg, setExportStatusMsg] = useState<string | null>(null);
   const [playingTakeId, setPlayingTakeId] = useState<string | null>(null);
   const [playingAnchorCompare, setPlayingAnchorCompare] = useState<boolean>(false);
+  const [editingTrimTakeId, setEditingTrimTakeId] = useState<string | null>(
+    takes[0]?.id || null
+  );
 
   // Local WAV Export Settings
   const [exportSampleRate, setExportSampleRate] = useState<24000 | 44100 | 48000>(44100);
@@ -106,8 +118,54 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
   const [exportingTakeId, setExportingTakeId] = useState<string | null>(null);
   const [isExportingBatch, setIsExportingBatch] = useState<boolean>(false);
 
+  // Multi-Task Batch Processing Queue State
+  const [batchQueue, setBatchQueue] = useState<BatchQueueTask[]>([
+    {
+      id: 'batch-seed-1',
+      label: 'Batch Task 01 · Podcast Intro',
+      script: SAMPLE_SCRIPTS[0].text,
+      nuanceSettings: {
+        pacing: 1.0,
+        pitchSemitones: 0,
+        expressiveness: 80,
+        emotionalTone: 'Warm & Conversational',
+        warmth: 65,
+        applyDspCalibration: true,
+      },
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: 'batch-seed-2',
+      label: 'Batch Task 02 · Expressive Reflection',
+      script: SAMPLE_SCRIPTS[1].text,
+      nuanceSettings: {
+        pacing: 0.96,
+        pitchSemitones: -0.4,
+        expressiveness: 85,
+        emotionalTone: 'Reflective & Intimate',
+        warmth: 75,
+        applyDspCalibration: true,
+      },
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+  const [isRunningBatchQueue, setIsRunningBatchQueue] = useState<boolean>(false);
+  const [batchProgressText, setBatchProgressText] = useState<string | null>(null);
+  const [takeSourceFilter, setTakeSourceFilter] = useState<'all' | 'batch' | 'single'>('all');
+
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (activeAudioRef.current) {
+        activeAudioRef.current.pause();
+        activeAudioRef.current = null;
+      }
+    };
+  }, []);
 
   const insertTokenAtCursor = (token: string) => {
     const el = textareaRef.current;
@@ -161,12 +219,7 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
     }
   };
 
-  const handleSynthesizeSpeech = async () => {
-    if (!scriptText.trim()) {
-      setErrorMsg('Please enter text to convert into speech.');
-      return;
-    }
-
+  const validateDataFloorBeforeSynthesis = (): boolean => {
     if (!diagnostic.meetsDataFloor) {
       const lowest = diagnostic.lowestConfidenceElements[0];
       setErrorMsg(
@@ -180,81 +233,271 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
           1
         )}s of your voice in the Anchor Lab or Speaker Diarizer first.`
       );
+      return false;
+    }
+    return true;
+  };
+
+  const executeSingleTaskSynthesis = async (
+    taskScript: string,
+    taskNuance: NuanceSettings,
+    batchTaskLabel?: string
+  ): Promise<SynthesisTake> => {
+    const effectiveProfile = diagnostic.liveLearnedProfile || activeProfile;
+
+    const resp = await fetch('/api/voice/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        script: taskScript,
+        voiceProfile: effectiveProfile,
+        nuanceSettings: taskNuance,
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok || !data.wavBase64) {
+      throw new Error(data.error || 'Voice synthesis failed.');
+    }
+
+    let finalWavBase64 = data.wavBase64;
+    let durationSec = 0;
+    let waveformPeaks: number[] = [];
+
+    if (taskNuance.applyDspCalibration) {
+      const totalPitch =
+        Number(effectiveProfile.dspCalibration.pitchShiftSemitones || 0) +
+        Number(taskNuance.pitchSemitones || 0);
+      const totalRate =
+        Number(effectiveProfile.dspCalibration.playbackRate || 1.0) *
+        Number(taskNuance.pacing || 1.0);
+      const warmthOffsetDb =
+        Number(effectiveProfile.dspCalibration.formantWarmthDb || 0) +
+        ((taskNuance.warmth - 50) / 50) * 3.0;
+
+      const calibrated = await applyVocalDspCalibrationToWav(data.wavBase64, {
+        pitchSemitones: totalPitch,
+        playbackRate: totalRate,
+        formantWarmthDb: warmthOffsetDb,
+      });
+      finalWavBase64 = calibrated.calibratedWavBase64;
+      durationSec = calibrated.durationSec;
+      waveformPeaks = calibrated.waveformPeaks;
+    } else {
+      const buf = await base64ToAudioBuffer(data.wavBase64);
+      const metrics = extractAcousticDspMetrics(buf);
+      durationSec = metrics.durationSec;
+      waveformPeaks = metrics.waveformPeaks;
+    }
+
+    const newTake: SynthesisTake = {
+      id: `take-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      profileId: activeProfile.id,
+      profileName: activeProfile.name,
+      rawScript: taskScript,
+      compiledStyle: data.compiledStyle,
+      foundationVoiceUsed: data.foundationVoiceUsed || activeProfile.baseFoundationVoice,
+      nuanceSettings: { ...taskNuance },
+      rawWavBase64: data.wavBase64,
+      calibratedWavBase64: finalWavBase64,
+      originalCalibratedWavBase64: finalWavBase64,
+      originalRawWavBase64: data.wavBase64,
+      originalDurationSec: durationSec,
+      durationSec,
+      waveformPeaks,
+      batchTaskLabel,
+      createdAt: new Date().toISOString(),
+    };
+
+    return newTake;
+  };
+
+  const handleSynthesizeSpeech = async () => {
+    if (!scriptText.trim()) {
+      setErrorMsg('Please enter text to convert into speech.');
       return;
     }
 
-    const effectiveProfile = diagnostic.liveLearnedProfile || activeProfile;
+    if (!validateDataFloorBeforeSynthesis()) {
+      return;
+    }
 
     setIsSynthesizing(true);
     setErrorMsg(null);
 
     try {
-      const resp = await fetch('/api/voice/synthesize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          script: scriptText,
-          voiceProfile: effectiveProfile,
-          nuanceSettings: nuance,
-        }),
-      });
-
-      const data = await resp.json();
-      if (!resp.ok || !data.wavBase64) {
-        throw new Error(data.error || 'Voice synthesis failed.');
-      }
-
-      let finalWavBase64 = data.wavBase64;
-      let durationSec = 0;
-      let waveformPeaks: number[] = [];
-
-      if (nuance.applyDspCalibration) {
-        const totalPitch =
-          Number(activeProfile.dspCalibration.pitchShiftSemitones || 0) +
-          Number(nuance.pitchSemitones || 0);
-        const totalRate =
-          Number(activeProfile.dspCalibration.playbackRate || 1.0) *
-          Number(nuance.pacing || 1.0);
-        const warmthOffsetDb =
-          Number(activeProfile.dspCalibration.formantWarmthDb || 0) +
-          ((nuance.warmth - 50) / 50) * 3.0;
-
-        const calibrated = await applyVocalDspCalibrationToWav(data.wavBase64, {
-          pitchSemitones: totalPitch,
-          playbackRate: totalRate,
-          formantWarmthDb: warmthOffsetDb,
-        });
-        finalWavBase64 = calibrated.calibratedWavBase64;
-        durationSec = calibrated.durationSec;
-        waveformPeaks = calibrated.waveformPeaks;
-      } else {
-        const buf = await base64ToAudioBuffer(data.wavBase64);
-        const metrics = extractAcousticDspMetrics(buf);
-        durationSec = metrics.durationSec;
-        waveformPeaks = metrics.waveformPeaks;
-      }
-
-      const newTake: SynthesisTake = {
-        id: `take-${Date.now()}`,
-        profileId: activeProfile.id,
-        profileName: activeProfile.name,
-        rawScript: scriptText,
-        compiledStyle: data.compiledStyle,
-        foundationVoiceUsed: data.foundationVoiceUsed || activeProfile.baseFoundationVoice,
-        nuanceSettings: { ...nuance },
-        rawWavBase64: data.wavBase64,
-        calibratedWavBase64: finalWavBase64,
-        durationSec,
-        waveformPeaks,
-        createdAt: new Date().toISOString(),
-      };
-
+      const newTake = await executeSingleTaskSynthesis(scriptText, nuance);
       onAddTake(newTake);
+      setEditingTrimTakeId(newTake.id);
       playTakeAudio(newTake);
     } catch (err: any) {
       setErrorMsg(err?.message || 'Error generating speech audio.');
     } finally {
       setIsSynthesizing(false);
+    }
+  };
+
+  const handleEnqueueCurrentScript = () => {
+    const trimmed = scriptText.trim();
+    if (!trimmed) {
+      setErrorMsg('Enter a script in the editor before queuing a batch task.');
+      return;
+    }
+    setErrorMsg(null);
+    const nextNum = batchQueue.length + 1;
+    const newTask: BatchQueueTask = {
+      id: `batch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      label: `Batch Task ${String(nextNum).padStart(2, '0')} · ${nuance.emotionalTone}`,
+      script: trimmed,
+      nuanceSettings: { ...nuance },
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+    };
+    setBatchQueue((prev) => [...prev, newTask]);
+  };
+
+  const handleSplitScriptIntoBatchTasks = () => {
+    const trimmed = scriptText.trim();
+    if (!trimmed) {
+      setErrorMsg('Enter multiple lines or sentences in the script editor to split into batch tasks.');
+      return;
+    }
+
+    // Split by newline first; if only 1 line, split by sentence boundaries
+    let parts = trimmed
+      .split(/\n+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    if (parts.length <= 1) {
+      parts = trimmed
+        .split(/(?<=[.!?])\s+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+    }
+
+    if (parts.length === 0) return;
+
+    setErrorMsg(null);
+    const baseIndex = batchQueue.length;
+    const createdTasks: BatchQueueTask[] = parts.map((segmentText, idx) => ({
+      id: `batch-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+      label: `Batch Task ${String(baseIndex + idx + 1).padStart(2, '0')} · Segment ${idx + 1}`,
+      script: segmentText,
+      nuanceSettings: { ...nuance },
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+    }));
+
+    setBatchQueue((prev) => [...prev, ...createdTasks]);
+  };
+
+  const handleLoadThreePresetBatch = () => {
+    setErrorMsg(null);
+    const tones: EmotionalTonePreset[] = [
+      'Warm & Conversational',
+      'Reflective & Intimate',
+      'Authoritative & Crisp',
+    ];
+    const presetTasks: BatchQueueTask[] = SAMPLE_SCRIPTS.map((preset, idx) => ({
+      id: `batch-preset-${Date.now()}-${idx}`,
+      label: `Batch Task ${String(idx + 1).padStart(2, '0')} · ${preset.label}`,
+      script: preset.text,
+      nuanceSettings: {
+        ...nuance,
+        emotionalTone: tones[idx % tones.length],
+      },
+      status: 'queued',
+      createdAt: new Date().toISOString(),
+    }));
+    setBatchQueue(presetTasks);
+  };
+
+  const handleUpdateBatchTask = (taskId: string, patch: Partial<BatchQueueTask>) => {
+    setBatchQueue((prev) =>
+      prev.map((task) => (task.id === taskId ? { ...task, ...patch } : task))
+    );
+  };
+
+  const handleRemoveBatchTask = (taskId: string) => {
+    setBatchQueue((prev) => prev.filter((task) => task.id !== taskId));
+  };
+
+  const handleRunBatchQueue = async () => {
+    const runnableTasks = batchQueue.filter(
+      (t) => (t.status === 'queued' || t.status === 'failed') && t.script.trim().length > 0
+    );
+
+    if (runnableTasks.length === 0) {
+      setErrorMsg('No pending or failed tasks in the batch queue. Add or reset tasks to run batch synthesis.');
+      return;
+    }
+
+    if (!validateDataFloorBeforeSynthesis()) {
+      return;
+    }
+
+    setIsRunningBatchQueue(true);
+    setErrorMsg(null);
+    let completedCount = 0;
+    let lastGeneratedTake: SynthesisTake | null = null;
+
+    for (let i = 0; i < runnableTasks.length; i++) {
+      const task = runnableTasks[i];
+      setBatchProgressText(
+        `Processing ${i + 1} of ${runnableTasks.length}: ${task.label}`
+      );
+
+      setBatchQueue((prev) =>
+        prev.map((item) =>
+          item.id === task.id
+            ? { ...item, status: 'processing', errorMessage: undefined }
+            : item
+        )
+      );
+
+      try {
+        const generatedTake = await executeSingleTaskSynthesis(
+          task.script,
+          task.nuanceSettings,
+          task.label
+        );
+        onAddTake(generatedTake);
+        lastGeneratedTake = generatedTake;
+        completedCount++;
+
+        setBatchQueue((prev) =>
+          prev.map((item) =>
+            item.id === task.id
+              ? {
+                  ...item,
+                  status: 'completed',
+                  generatedTakeId: generatedTake.id,
+                  errorMessage: undefined,
+                }
+              : item
+          )
+        );
+      } catch (err: any) {
+        const message = err?.message || 'Batch task synthesis failed.';
+        setBatchQueue((prev) =>
+          prev.map((item) =>
+            item.id === task.id
+              ? { ...item, status: 'failed', errorMessage: message }
+              : item
+          )
+        );
+      }
+    }
+
+    setIsRunningBatchQueue(false);
+    setBatchProgressText(null);
+
+    if (lastGeneratedTake) {
+      setEditingTrimTakeId(lastGeneratedTake.id);
+      setExportStatusMsg(
+        `Batch synthesis complete: ${completedCount} of ${runnableTasks.length} queued tasks synthesized and added to the unified takes list below.`
+      );
     }
   };
 
@@ -421,6 +664,15 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
   };
 
   const latestTake = takes[0] || null;
+  const pendingBatchCount = batchQueue.filter(
+    (t) => t.status === 'queued' || t.status === 'failed'
+  ).length;
+  const completedBatchCount = batchQueue.filter((t) => t.status === 'completed').length;
+  const filteredTakes = takes.filter((take) => {
+    if (takeSourceFilter === 'batch') return Boolean(take.batchTaskLabel);
+    if (takeSourceFilter === 'single') return !take.batchTaskLabel;
+    return true;
+  });
 
   return (
     <div className="space-y-8">
@@ -584,17 +836,34 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
             </div>
           </div>
 
-          {/* Primary Synthesize Button */}
-          <div className="pt-4 border-t border-slate-800 flex items-center justify-between gap-4">
-            <div className="text-xs text-slate-400">
-              Engine: <span className="font-mono text-slate-200">gemini-3.8-flash-tts</span> (24kHz
-              WAV + Web Audio Formant Lock)
+          {/* Primary Synthesize & Batch Queue Action Bar */}
+          <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleEnqueueCurrentScript}
+                disabled={isSynthesizing || isRunningBatchQueue || !scriptText.trim()}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-cyan-300 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Add current script and nuance settings to the batch synthesis queue"
+              >
+                <ListPlus className="w-3.5 h-3.5" />
+                + Queue Task for Batch
+              </button>
+
+              <button
+                onClick={handleSplitScriptIntoBatchTasks}
+                disabled={isSynthesizing || isRunningBatchQueue || !scriptText.trim()}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 border border-slate-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                title="Split multi-line or multi-sentence text into separate queued batch tasks"
+              >
+                <Split className="w-3.5 h-3.5" />
+                Split Lines → Batch Queue
+              </button>
             </div>
 
             <button
               onClick={handleSynthesizeSpeech}
-              disabled={isSynthesizing || !scriptText.trim()}
-              className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              disabled={isSynthesizing || isRunningBatchQueue || !scriptText.trim()}
+              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
               {isSynthesizing ? (
                 <>
@@ -604,7 +873,7 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  Synthesize Audio Output
+                  Synthesize Single Take
                 </>
               )}
             </button>
@@ -769,16 +1038,282 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
         </div>
       </div>
 
-      {/* Master Output Player, Local WAV Export Suite & Synthesized Takes History */}
+      {/* Multi-Task Batch Synthesis Queue */}
       <div className="bg-[#111827] border border-slate-800 rounded-xl p-6 space-y-5">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-800">
           <div>
-            <h2 className="text-base font-semibold text-slate-100">
-              Master Audio Output & Local WAV Export Studio ({takes.length})
-            </h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-base font-semibold text-slate-100">
+                Batch Text-to-Speech Task Queue
+              </h2>
+              <span className="text-xs font-mono tabular-nums text-slate-400">
+                {batchQueue.length} total · {pendingBatchCount} pending · {completedBatchCount} completed
+              </span>
+            </div>
             <p className="text-xs text-slate-400 mt-0.5">
-              Audition generated takes, configure PCM sample rate (24 kHz / 44.1 kHz / 48 kHz), and
-              export individual or stitched master WAV files to your local disk.
+              Queue multiple scripts with distinct emotional tones or pacing, run sequential batch
+              processing with one click, and view all generated takes in the unified list below.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              onClick={handleLoadThreePresetBatch}
+              disabled={isRunningBatchQueue || isSynthesizing}
+              className="px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Load 3-Task Preset Batch
+            </button>
+
+            {completedBatchCount > 0 && (
+              <button
+                onClick={() =>
+                  setBatchQueue((prev) =>
+                    prev.map((t) => ({ ...t, status: 'queued', errorMessage: undefined }))
+                  )
+                }
+                disabled={isRunningBatchQueue || isSynthesizing}
+                className="px-3 py-2 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Re-Queue Completed
+              </button>
+            )}
+
+            {batchQueue.length > 0 && (
+              <button
+                onClick={() => setBatchQueue([])}
+                disabled={isRunningBatchQueue || isSynthesizing}
+                className="px-3 py-2 text-xs font-medium text-slate-400 hover:text-rose-300 bg-slate-900 hover:bg-rose-950/60 border border-slate-800 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Clear Queue
+              </button>
+            )}
+
+            <button
+              onClick={handleRunBatchQueue}
+              disabled={isRunningBatchQueue || isSynthesizing || pendingBatchCount === 0}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-slate-950 bg-cyan-400 hover:bg-cyan-300 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isRunningBatchQueue ? (
+                <>
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  {batchProgressText || 'Processing Batch Queue...'}
+                </>
+              ) : (
+                <>
+                  <PlayCircle className="w-4 h-4" />
+                  Run Batch Queue ({pendingBatchCount} {pendingBatchCount === 1 ? 'Task' : 'Tasks'})
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {batchQueue.length === 0 ? (
+          <div className="py-8 text-center border border-dashed border-slate-800 rounded-lg space-y-2">
+            <ListPlus className="w-6 h-6 text-slate-500 mx-auto" />
+            <p className="text-sm font-medium text-slate-200">
+              Batch queue is currently empty
+            </p>
+            <p className="text-xs text-slate-400 max-w-md mx-auto">
+              Use “+ Queue Task for Batch” or “Split Lines → Batch Queue” in the script editor
+              above, or load the 3-Task Preset Batch to process multiple takes sequentially.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {batchQueue.map((task, idx) => {
+              const linkedTake = task.generatedTakeId
+                ? takes.find((t) => t.id === task.generatedTakeId)
+                : undefined;
+
+              return (
+                <div
+                  key={task.id}
+                  className={`p-4 rounded-xl border transition-colors ${
+                    task.status === 'processing'
+                      ? 'bg-cyan-950/30 border-cyan-500/60'
+                      : task.status === 'completed'
+                      ? 'bg-emerald-950/20 border-emerald-700/50'
+                      : task.status === 'failed'
+                      ? 'bg-rose-950/30 border-rose-700/60'
+                      : 'bg-slate-950/80 border-slate-800'
+                  }`}
+                >
+                  <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums">
+                      <span className="text-cyan-400 font-semibold">
+                        #{String(idx + 1).padStart(2, '0')}
+                      </span>
+                      <input
+                        type="text"
+                        value={task.label}
+                        disabled={isRunningBatchQueue}
+                        onChange={(e) =>
+                          handleUpdateBatchTask(task.id, { label: e.target.value })
+                        }
+                        className="px-2 py-1 rounded bg-slate-900 border border-slate-800 text-xs font-sans font-medium text-slate-100 focus:outline-none focus:border-cyan-400"
+                      />
+                      <span aria-hidden="true" className="text-slate-600">
+                        ·
+                      </span>
+                      <select
+                        value={task.nuanceSettings.emotionalTone}
+                        disabled={isRunningBatchQueue}
+                        onChange={(e) =>
+                          handleUpdateBatchTask(task.id, {
+                            nuanceSettings: {
+                              ...task.nuanceSettings,
+                              emotionalTone: e.target.value as EmotionalTonePreset,
+                            },
+                          })
+                        }
+                        className="px-2.5 py-1 rounded bg-slate-900 border border-slate-800 text-xs font-sans text-slate-200 focus:outline-none focus:border-cyan-400"
+                      >
+                        {EMOTIONAL_TONES.map((tone) => (
+                          <option key={tone} value={tone}>
+                            {tone}
+                          </option>
+                        ))}
+                      </select>
+                      <span aria-hidden="true" className="text-slate-600">
+                        ·
+                      </span>
+                      <span className="text-slate-400">
+                        {task.nuanceSettings.pacing.toFixed(2)}x ·{' '}
+                        {task.nuanceSettings.pitchSemitones >= 0 ? '+' : ''}
+                        {task.nuanceSettings.pitchSemitones.toFixed(1)} st
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      {task.status === 'queued' && (
+                        <span className="text-xs font-mono text-slate-400">
+                          Status: Queued
+                        </span>
+                      )}
+                      {task.status === 'processing' && (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-mono text-cyan-300">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Synthesizing...
+                        </span>
+                      )}
+                      {task.status === 'completed' && (
+                        <span className="inline-flex items-center gap-1 text-xs font-mono text-emerald-400">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          Completed
+                        </span>
+                      )}
+                      {task.status === 'failed' && (
+                        <span className="inline-flex items-center gap-1 text-xs font-mono text-rose-400">
+                          <AlertCircle className="w-3.5 h-3.5" />
+                          Failed
+                        </span>
+                      )}
+
+                      {linkedTake && (
+                        <button
+                          onClick={() => playTakeAudio(linkedTake)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          {playingTakeId === linkedTake.id ? (
+                            <>
+                              <Volume2 className="w-3 h-3 animate-pulse" />
+                              Stop
+                            </>
+                          ) : (
+                            <>
+                              <Play className="w-3 h-3" />
+                              Play Output ({linkedTake.durationSec}s)
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      <button
+                        onClick={() => handleRemoveBatchTask(task.id)}
+                        disabled={isRunningBatchQueue}
+                        className="p-1.5 rounded bg-slate-900 hover:bg-rose-950 text-slate-400 hover:text-rose-300 disabled:opacity-40 transition-colors cursor-pointer"
+                        title="Remove task from queue"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-2.5">
+                    <textarea
+                      rows={2}
+                      value={task.script}
+                      disabled={isRunningBatchQueue}
+                      onChange={(e) =>
+                        handleUpdateBatchTask(task.id, {
+                          script: e.target.value,
+                          status: task.status === 'completed' ? 'queued' : task.status,
+                        })
+                      }
+                      className="w-full p-2.5 rounded-lg bg-slate-900/90 border border-slate-800 text-xs text-slate-100 leading-relaxed focus:outline-none focus:border-cyan-400"
+                    />
+                  </div>
+
+                  {task.errorMessage && (
+                    <p className="text-xs text-rose-300 mt-1.5">
+                      Error: {task.errorMessage}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Unified Generated Takes List, Waveform Trim Editor & Local WAV Export Studio */}
+      <div className="bg-[#111827] border border-slate-800 rounded-xl p-6 space-y-5">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-800">
+          <div>
+            <div className="flex flex-wrap items-center gap-3">
+              <h2 className="text-base font-semibold text-slate-100">
+                Unified Generated Takes List & Local WAV Export Studio ({takes.length})
+              </h2>
+              {takes.length > 0 && (
+                <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-lg border border-slate-800">
+                  <button
+                    onClick={() => setTakeSourceFilter('all')}
+                    className={`px-2.5 py-1 text-xs rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      takeSourceFilter === 'all'
+                        ? 'bg-amber-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    All Takes ({takes.length})
+                  </button>
+                  <button
+                    onClick={() => setTakeSourceFilter('batch')}
+                    className={`px-2.5 py-1 text-xs rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      takeSourceFilter === 'batch'
+                        ? 'bg-cyan-400 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Batch Queue ({takes.filter((t) => Boolean(t.batchTaskLabel)).length})
+                  </button>
+                  <button
+                    onClick={() => setTakeSourceFilter('single')}
+                    className={`px-2.5 py-1 text-xs rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      takeSourceFilter === 'single'
+                        ? 'bg-amber-500 text-slate-950 font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Single Runs ({takes.filter((t) => !t.batchTaskLabel).length})
+                  </button>
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-slate-400 mt-1">
+              All single and batch-processed takes appear in this unified list. Audition, trim
+              waveforms, stitch into a master WAV, or export individual 16-bit PCM WAV files.
             </p>
           </div>
 
@@ -875,25 +1410,27 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
           </div>
         )}
 
-        {takes.length === 0 ? (
+        {filteredTakes.length === 0 ? (
           <div className="py-12 text-center border border-dashed border-slate-800 rounded-lg space-y-2">
             <FileAudio className="w-7 h-7 text-slate-500 mx-auto" />
             <p className="text-sm font-medium text-slate-200">
-              No synthesized audio outputs yet
+              No synthesized audio outputs matching this view
             </p>
             <p className="text-xs text-slate-400 max-w-md mx-auto">
-              Enter or customize your script above and click “Synthesize Audio Output” to generate
-              speech replicated to your vocal nuances and export local WAV files.
+              Click “Synthesize Single Take” or “Run Batch Queue” above to generate speech
+              replicated to your vocal nuances and view all takes in this unified list.
             </p>
           </div>
         ) : (
           <div className="space-y-4">
-            {takes.map((take, idx) => {
+            {filteredTakes.map((take) => {
               const isPlaying = playingTakeId === take.id;
               const isLatest = latestTake?.id === take.id;
-              const takeNumber = takes.length - idx;
+              const chronologicalIndex = takes.findIndex((t) => t.id === take.id);
+              const takeNumber = takes.length - (chronologicalIndex >= 0 ? chronologicalIndex : 0);
               const isExportingCalibrated = exportingTakeId === `${take.id}-calibrated`;
               const isExportingRaw = exportingTakeId === `${take.id}-raw`;
+              const isTrimOpen = editingTrimTakeId === take.id;
 
               return (
                 <div
@@ -923,6 +1460,14 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
                           <span className="text-amber-400 font-semibold">
                             Take #{takeNumber}
                           </span>
+                          {take.batchTaskLabel && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-cyan-300 font-medium">
+                                {take.batchTaskLabel}
+                              </span>
+                            </>
+                          )}
                           <span aria-hidden="true">·</span>
                           <span className="text-slate-200">{take.profileName}</span>
                           <span aria-hidden="true">·</span>
@@ -938,6 +1483,15 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
                           <span className="text-cyan-400">
                             {take.durationSec}s · {formatWavSizeKb(take.durationSec, exportSampleRate)}
                           </span>
+                          {take.isTrimmed && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-emerald-400">
+                                Cropped ({take.lastTrimStartSec?.toFixed(2)}s–
+                                {take.lastTrimEndSec?.toFixed(2)}s)
+                              </span>
+                            </>
+                          )}
                         </div>
 
                         <p className="text-sm text-slate-100 leading-relaxed">
@@ -947,6 +1501,21 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        onClick={() =>
+                          setEditingTrimTakeId(isTrimOpen ? null : take.id)
+                        }
+                        className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                          isTrimOpen
+                            ? 'bg-amber-500/20 border-amber-500 text-amber-300'
+                            : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-200'
+                        }`}
+                        title="Open visual waveform editor to trim or crop beginning and end"
+                      >
+                        <Scissors className="w-3.5 h-3.5" />
+                        {isTrimOpen ? 'Hide Trim Editor' : 'Trim / Crop Waveform'}
+                      </button>
+
                       <button
                         onClick={() => handleExportTakeWav(take, takeNumber, 'calibrated')}
                         disabled={isExportingCalibrated || isExportingRaw}
@@ -993,6 +1562,17 @@ export const SynthesisStudio: React.FC<SynthesisStudioProps> = ({
                       isPlaying={isPlaying}
                     />
                   </div>
+
+                  {isTrimOpen && (
+                    <WaveformTrimEditor
+                      take={take}
+                      takeNumber={takeNumber}
+                      exportSampleRate={exportSampleRate}
+                      exportFilePrefix={exportFilePrefix}
+                      onApplyTrimToTake={onUpdateTake}
+                      onClose={() => setEditingTrimTakeId(null)}
+                    />
+                  )}
 
                   <div className="mt-3 pt-2.5 border-t border-slate-800/80 text-xs text-slate-400 truncate">
                     <span className="text-slate-500">Compiled Voice Design Style:</span>{' '}

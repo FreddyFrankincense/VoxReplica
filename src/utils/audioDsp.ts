@@ -243,7 +243,8 @@ export function audioBufferSliceToWavBase64(
 }
 
 /**
- * Decodes a Base64 audio string into an AudioBuffer.
+ * Decodes a Base64 audio string into an AudioBuffer using an OfflineAudioContext
+ * (avoids hitting browser active hardware AudioContext limits during batch operations).
  */
 export async function base64ToAudioBuffer(base64: string): Promise<AudioBuffer> {
   const binaryString = atob(base64);
@@ -252,11 +253,16 @@ export async function base64ToAudioBuffer(base64: string): Promise<AudioBuffer> 
   for (let i = 0; i < len; i++) {
     bytes[i] = binaryString.charCodeAt(i);
   }
+  const OfflineCtx =
+    window.OfflineAudioContext || (window as any).webkitOfflineAudioContext;
+  if (OfflineCtx) {
+    const offlineCtx = new OfflineCtx(1, 1, 44100);
+    return await offlineCtx.decodeAudioData(bytes.buffer.slice(0));
+  }
   const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
   const ctx = new AudioCtx();
   try {
-    const audioBuffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
-    return audioBuffer;
+    return await ctx.decodeAudioData(bytes.buffer.slice(0));
   } finally {
     if (ctx.state !== 'closed') {
       await ctx.close().catch(() => {});
@@ -365,14 +371,16 @@ export function sliceAudioBufferIntoConversationalTurns(
 
     const segDuration = Number((nextBoundarySec - cursorSec).toFixed(2));
     if (segDuration >= 1.2) {
-      // Create a sub-buffer to extract exact DSP metrics for this turn
+      // Create a lightweight sub-buffer to extract exact DSP metrics for this turn
       const startSample = Math.floor(cursorSec * sampleRate);
       const endSample = Math.min(audioBuffer.length, Math.floor(nextBoundarySec * sampleRate));
       const frameLen = Math.max(1, endSample - startSample);
 
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      const offlineCtx = new OfflineAudioContext(1, frameLen, sampleRate);
-      const subBuffer = offlineCtx.createBuffer(1, frameLen, sampleRate);
+      const subBuffer = new AudioBuffer({
+        length: frameLen,
+        numberOfChannels: 1,
+        sampleRate,
+      });
       subBuffer.copyToChannel(channelData.subarray(startSample, endSample), 0);
 
       const dspMetrics = extractAcousticDspMetrics(subBuffer);
@@ -532,15 +540,15 @@ export function downloadWavFile(wavBase64: string, filename: string): void {
 
 /**
  * Resamples a WAV buffer to a target sample rate (24000 Hz, 44100 Hz, or 48000 Hz)
- * using Web Audio OfflineAudioContext hardware-quality resampling.
+ * and returns the raw mono Float32Array PCM samples directly.
  */
-export async function exportWavAtSampleRate(
+async function resampleWavBase64ToPcm(
   wavBase64: string,
   targetSampleRate: 24000 | 44100 | 48000
-): Promise<string> {
+): Promise<Float32Array> {
   const srcBuffer = await base64ToAudioBuffer(wavBase64);
   if (srcBuffer.sampleRate === targetSampleRate) {
-    return encodeMonoPcmToWavBase64(srcBuffer.getChannelData(0), targetSampleRate);
+    return new Float32Array(srcBuffer.getChannelData(0));
   }
 
   const outLength = Math.max(1, Math.round(srcBuffer.duration * targetSampleRate));
@@ -550,7 +558,19 @@ export async function exportWavAtSampleRate(
   source.connect(offlineCtx.destination);
   source.start(0);
   const rendered = await offlineCtx.startRendering();
-  return encodeMonoPcmToWavBase64(rendered.getChannelData(0), targetSampleRate);
+  return new Float32Array(rendered.getChannelData(0));
+}
+
+/**
+ * Resamples a WAV buffer to a target sample rate (24000 Hz, 44100 Hz, or 48000 Hz)
+ * using Web Audio OfflineAudioContext hardware-quality resampling.
+ */
+export async function exportWavAtSampleRate(
+  wavBase64: string,
+  targetSampleRate: 24000 | 44100 | 48000
+): Promise<string> {
+  const pcm = await resampleWavBase64ToPcm(wavBase64, targetSampleRate);
+  return encodeMonoPcmToWavBase64(pcm, targetSampleRate);
 }
 
 /**
@@ -564,9 +584,8 @@ export async function stitchTakesToMasterWav(
 ): Promise<{ wavBase64: string; totalDurationSec: number; fileSizeBytes: number }> {
   const decodedBuffers: Float32Array[] = [];
   for (const b64 of wavBase64List) {
-    const resampledB64 = await exportWavAtSampleRate(b64, targetSampleRate);
-    const buf = await base64ToAudioBuffer(resampledB64);
-    decodedBuffers.push(new Float32Array(buf.getChannelData(0)));
+    const pcm = await resampleWavBase64ToPcm(b64, targetSampleRate);
+    decodedBuffers.push(pcm);
   }
 
   const gapSamples = Math.max(0, Math.round(silenceGapSec * targetSampleRate));
@@ -594,4 +613,182 @@ export async function stitchTakesToMasterWav(
     fileSizeBytes,
   };
 }
+
+/**
+ * Extracts high-resolution waveform peak buckets (e.g., 160 buckets) from a Base64 WAV buffer
+ * for interactive visual waveform trimming.
+ */
+export async function extractHighResWaveformPeaks(
+  wavBase64: string,
+  bucketCount = 160
+): Promise<{ peaks: number[]; durationSec: number; sampleRate: number }> {
+  const audioBuffer = await base64ToAudioBuffer(wavBase64);
+  const channelData = audioBuffer.getChannelData(0);
+  const samplesPerBucket = Math.max(1, Math.floor(channelData.length / bucketCount));
+  const rawPeaks: number[] = [];
+  let maxPeak = 0.01;
+
+  for (let b = 0; b < bucketCount; b++) {
+    const startIdx = b * samplesPerBucket;
+    const endIdx = Math.min(channelData.length, startIdx + samplesPerBucket);
+    let peak = 0;
+    for (let i = startIdx; i < endIdx; i++) {
+      const abs = Math.abs(channelData[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > maxPeak) maxPeak = peak;
+    rawPeaks.push(peak);
+  }
+
+  const peaks = rawPeaks.map((p) => Number(Math.max(0.04, p / maxPeak).toFixed(3)));
+  return {
+    peaks,
+    durationSec: Number(audioBuffer.duration.toFixed(2)),
+    sampleRate: audioBuffer.sampleRate,
+  };
+}
+
+/**
+ * Scans the leading and trailing RMS envelope of a WAV buffer to automatically detect
+ * where active speech begins and ends (for 1-click Auto-Trim Silence).
+ */
+export async function detectSilenceTrimBounds(
+  wavBase64: string,
+  rmsThreshold = 0.016
+): Promise<{ trimStartSec: number; trimEndSec: number; durationSec: number }> {
+  const audioBuffer = await base64ToAudioBuffer(wavBase64);
+  const channelData = audioBuffer.getChannelData(0);
+  const sampleRate = audioBuffer.sampleRate;
+  const durationSec = Number(audioBuffer.duration.toFixed(2));
+
+  const windowSize = Math.max(1, Math.floor(sampleRate * 0.02)); // 20ms frame
+  const hopSize = Math.max(1, Math.floor(sampleRate * 0.01)); // 10ms hop
+
+  let firstActiveSample = 0;
+  let lastActiveSample = channelData.length;
+
+  for (let start = 0; start + windowSize <= channelData.length; start += hopSize) {
+    let sumSq = 0;
+    for (let i = 0; i < windowSize; i++) {
+      const s = channelData[start + i];
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / windowSize);
+    if (rms >= rmsThreshold) {
+      firstActiveSample = Math.max(0, start - Math.floor(sampleRate * 0.03)); // Keep 30ms natural breath attack
+      break;
+    }
+  }
+
+  for (
+    let start = channelData.length - windowSize;
+    start >= firstActiveSample;
+    start -= hopSize
+  ) {
+    let sumSq = 0;
+    for (let i = 0; i < windowSize; i++) {
+      const s = channelData[start + i];
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / windowSize);
+    if (rms >= rmsThreshold) {
+      lastActiveSample = Math.min(
+        channelData.length,
+        start + windowSize + Math.floor(sampleRate * 0.04) // Keep 40ms natural decay tail
+      );
+      break;
+    }
+  }
+
+  let trimStartSec = Number((firstActiveSample / sampleRate).toFixed(2));
+  let trimEndSec = Number((lastActiveSample / sampleRate).toFixed(2));
+
+  if (trimEndSec - trimStartSec < 0.25) {
+    trimStartSec = 0;
+    trimEndSec = durationSec;
+  }
+
+  return {
+    trimStartSec,
+    trimEndSec,
+    durationSec,
+  };
+}
+
+/**
+ * Crops a Base64 WAV buffer between startSec and endSec with optional 15ms micro-fade in/out
+ * to prevent zero-crossing clicks at the trim boundaries.
+ */
+export async function cropWavBase64(
+  wavBase64: string,
+  startSec: number,
+  endSec: number,
+  applyMicroFade = true
+): Promise<{
+  croppedWavBase64: string;
+  durationSec: number;
+  waveformPeaks: number[];
+}> {
+  const audioBuffer = await base64ToAudioBuffer(wavBase64);
+  const sampleRate = audioBuffer.sampleRate;
+  const channelData = audioBuffer.getChannelData(0);
+
+  const safeStartSec = Math.max(0, Math.min(startSec, audioBuffer.duration - 0.1));
+  const safeEndSec = Math.max(
+    safeStartSec + 0.1,
+    Math.min(endSec, audioBuffer.duration)
+  );
+
+  const startSample = Math.floor(safeStartSec * sampleRate);
+  const endSample = Math.min(channelData.length, Math.floor(safeEndSec * sampleRate));
+  const sliceLen = Math.max(1, endSample - startSample);
+
+  const slicedPcm = new Float32Array(sliceLen);
+  for (let i = 0; i < sliceLen; i++) {
+    slicedPcm[i] = channelData[startSample + i];
+  }
+
+  if (applyMicroFade) {
+    const fadeSamples = Math.min(
+      Math.floor(sliceLen / 4),
+      Math.floor(sampleRate * 0.015) // 15ms smooth de-click envelope
+    );
+    for (let i = 0; i < fadeSamples; i++) {
+      const gain = i / Math.max(1, fadeSamples);
+      slicedPcm[i] *= gain;
+      slicedPcm[sliceLen - 1 - i] *= gain;
+    }
+  }
+
+  // Extract 64 standard waveform peaks for the cropped take card
+  const bucketCount = 64;
+  const samplesPerBucket = Math.max(1, Math.floor(sliceLen / bucketCount));
+  const rawPeaks: number[] = [];
+  let maxPeak = 0.01;
+
+  for (let b = 0; b < bucketCount; b++) {
+    const bStart = b * samplesPerBucket;
+    const bEnd = Math.min(sliceLen, bStart + samplesPerBucket);
+    let peak = 0;
+    for (let i = bStart; i < bEnd; i++) {
+      const abs = Math.abs(slicedPcm[i]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > maxPeak) maxPeak = peak;
+    rawPeaks.push(peak);
+  }
+
+  const waveformPeaks = rawPeaks.map((p) =>
+    Number(Math.max(0.06, p / maxPeak).toFixed(3))
+  );
+  const croppedWavBase64 = encodeMonoPcmToWavBase64(slicedPcm, sampleRate);
+  const durationSec = Number((sliceLen / sampleRate).toFixed(2));
+
+  return {
+    croppedWavBase64,
+    durationSec,
+    waveformPeaks,
+  };
+}
+
 

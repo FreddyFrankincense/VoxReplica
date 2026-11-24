@@ -76,8 +76,13 @@ export const DEFAULT_VOICE_PROFILE: CustomVoiceProfile = {
   },
 };
 
+let dbPromise: Promise<IDBDatabase> | null = null;
+
 function openDatabase(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (dbPromise) {
+    return dbPromise;
+  }
+  dbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -85,9 +90,23 @@ function openDatabase(): Promise<IDBDatabase> {
         db.createObjectStore('kv');
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      db.onclose = () => {
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      dbPromise = null;
+      reject(request.error);
+    };
   });
+  return dbPromise;
 }
 
 export async function saveStoreValue<T>(key: string, value: T): Promise<void> {
